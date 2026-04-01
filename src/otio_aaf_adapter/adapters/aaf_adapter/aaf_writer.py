@@ -121,6 +121,7 @@ class AAFFileTranscriber:
         self.aaf_file.content.mobs.append(self.compositionmob)
         self._unique_mastermobs = {}
         self._unique_tapemobs = {}
+        self._unique_filemobs = {}
         self._clip_mob_ids_map = _gather_clip_mob_ids(input_otio, **kwargs)
 
         # transcribe timeline comments onto composition mob
@@ -128,13 +129,19 @@ class AAFFileTranscriber:
         self._transcribe_mob_attributes(input_otio, self.compositionmob)
 
     def _unique_mastermob(self, otio_clip):
-        """Get a unique mastermob, identified by clip metadata mob id."""
+        """Get a unique mastermob, identified by clip metadata mob id.
+
+        The MasterMob receives a fresh synthetic MobID rather than the
+        user-supplied MobID. In a correct AAF/MXF topology the user-supplied
+        MobID (typically the MXFUID from the source MXF file) belongs on the
+        file SourceMob so that Avid can relink to the physical media.
+        """
         mob_id = self._clip_mob_ids_map.get(otio_clip)
         mastermob = self._unique_mastermobs.get(mob_id)
         if not mastermob:
             mastermob = self.aaf_file.create.MasterMob()
             mastermob.name = otio_clip.name
-            mastermob.mob_id = aaf2.mobid.MobID(mob_id)
+            mastermob.mob_id = aaf2.mobid.MobID.new()
             self.aaf_file.content.mobs.append(mastermob)
             self._unique_mastermobs[mob_id] = mastermob
 
@@ -150,12 +157,22 @@ class AAFFileTranscriber:
         return mastermob
 
     def _unique_tapemob(self, otio_clip):
-        """Get a unique tapemob, identified by clip metadata mob id."""
+        """Get a unique tapemob, identified by clip metadata mob id.
+
+        The TapeMob gets a synthetic MobID (not the user-supplied MXFUID).
+        The MXFUID belongs on the FileMob for media relinking.
+        """
         mob_id = self._clip_mob_ids_map.get(otio_clip)
         tapemob = self._unique_tapemobs.get(mob_id)
         if not tapemob:
             tapemob = self.aaf_file.create.SourceMob()
-            tapemob.name = otio_clip.name
+            # TapeMob gets a synthetic MobID, not the user-supplied MXFUID
+            tapemob.mob_id = aaf2.mobid.MobID.new()
+            # Use custom tape name if provided, otherwise use clip name
+            tape_name = otio_clip.metadata.get("AAF", {}).get("TapeName")
+            if not tape_name:
+                tape_name = otio_clip.media_reference.metadata.get("AAF", {}).get("TapeName")
+            tapemob.name = tape_name or otio_clip.name
             tapemob.descriptor = self.aaf_file.create.ImportDescriptor()
             # If the edit_rate is not an integer, we need
             # to use drop frame with a nominal integer fps.
@@ -186,6 +203,26 @@ class AAFFileTranscriber:
                 tapemob.descriptor["Locator"].append(locator)
 
         return tapemob
+
+    def _unique_filemob(self, otio_clip):
+        """Get a unique file source mob, identified by clip metadata mob id.
+
+        The file SourceMob carries the user-supplied MobID (typically the
+        MXFUID from the source MXF file) so that Avid can relink to the
+        physical media. This is the mob that represents the actual file on
+        disk in the AAF mob chain:
+            CompositionMob -> MasterMob -> FileMob (SourceMob) -> TapeMob
+        """
+        mob_id = self._clip_mob_ids_map.get(otio_clip)
+        filemob = self._unique_filemobs.get(mob_id)
+        is_new = filemob is None
+        if is_new:
+            filemob = self.aaf_file.create.SourceMob()
+            filemob.name = otio_clip.name
+            filemob.mob_id = aaf2.mobid.MobID(mob_id)
+            self.aaf_file.content.mobs.append(filemob)
+            self._unique_filemobs[mob_id] = filemob
+        return filemob, is_new
 
     def track_transcriber(self, otio_track):
         """Return an appropriate _TrackTranscriber given an otio track."""
@@ -823,22 +860,38 @@ class _TrackTranscriber:
         """
         Return a file sourcemob for an otio Clip. Needs a tapemob and tapemob slot.
 
+        The file SourceMob carries the user-supplied MobID (typically the
+        MXFUID) and is deduplicated so that the same source clip referenced
+        from multiple tracks (e.g. video + audio) shares a single SourceMob.
+
         Returns:
             Returns a tuple of (FileMob, FileMobSlot)
         """
-        filemob = self.aaf_file.create.SourceMob()
-        self.aaf_file.content.mobs.append(filemob)
+        filemob, is_new = self.root_file_transcriber._unique_filemob(otio_clip)
+        if is_new:
+            filemob.descriptor = self.default_descriptor(otio_clip)
 
-        filemob.descriptor = self.default_descriptor(otio_clip)
-        filemob_slot = filemob.create_timeline_slot(self.edit_rate)
-        filemob_clip = filemob.create_source_clip(
-            slot_id=filemob_slot.slot_id,
-            length=tapemob_slot.segment.length,
-            media_kind=tapemob_slot.segment.media_kind)
-        filemob_clip.mob = tapemob
-        filemob_clip.slot = tapemob_slot
-        filemob_clip.slot_id = tapemob_slot.slot_id
-        filemob_slot.segment = filemob_clip
+        # Check if a slot already exists for this media kind to avoid duplicates
+        # when the same MXF is used for both video and audio tracks
+        filemob_slot = None
+        for slot in filemob.slots:
+            if (isinstance(slot, aaf2.mobslots.TimelineMobSlot) and
+                slot.segment and
+                slot.segment.media_kind == tapemob_slot.segment.media_kind):
+                filemob_slot = slot
+                break
+
+        if filemob_slot is None:
+            filemob_slot = filemob.create_timeline_slot(self.edit_rate)
+            filemob_clip = filemob.create_source_clip(
+                slot_id=filemob_slot.slot_id,
+                length=tapemob_slot.segment.length,
+                media_kind=tapemob_slot.segment.media_kind)
+            filemob_clip.mob = tapemob
+            filemob_clip.slot = tapemob_slot
+            filemob_clip.slot_id = tapemob_slot.slot_id
+            filemob_slot.segment = filemob_clip
+
         return filemob, filemob_slot
 
     def _create_mastermob(self, otio_clip, filemob, filemob_slot):

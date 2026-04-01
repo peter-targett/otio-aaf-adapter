@@ -1966,10 +1966,15 @@ def write_to_file(
             if not default_edit_rate:
                 default_edit_rate = transcriber.edit_rate
 
+            sequence_length = 0
             for otio_child in otio_track:
                 result = transcriber.transcribe(otio_child)
                 if result:
                     transcriber.sequence.components.append(result)
+                    sequence_length += result.length
+
+            # Set the sequence length after adding all components
+            transcriber.sequence.length = sequence_length
 
         # Always add a timecode track to the main composition mob.
         # This is required for compatibility with DaVinci Resolve.
