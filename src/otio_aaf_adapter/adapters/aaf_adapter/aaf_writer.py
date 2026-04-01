@@ -179,7 +179,7 @@ class AAFFileTranscriber:
             edit_rate = otio_clip.visible_range().duration.rate
             timecode_fps = round(edit_rate)
             tape_slot, tape_timecode_slot = tapemob.create_tape_slots(
-                otio_clip.name,
+                tape_name or otio_clip.name,
                 edit_rate=otio_clip.visible_range().duration.rate,
                 timecode_fps=round(otio_clip.visible_range().duration.rate),
                 drop_frame=(edit_rate != timecode_fps)
