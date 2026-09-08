@@ -1911,6 +1911,7 @@ def write_to_file(
     use_empty_mob_ids=False,
     embed_essence=False,
     create_edgecode=False,
+    link_media=False,
     **kwargs
 ):
     """Serialize `input_otio` to an AAF file at `filepath`.
@@ -1924,6 +1925,10 @@ def write_to_file(
         embed_essence(Optional[bool]): if `True`, media essence will be included in AAF
         create_edgecode(Optional[bool]): if `True` each clip will get an EdgeCode slot
                 assigned that defines the Avid Frame Count Start / End.
+        link_media(Optional[bool]): if `True`, clips referencing an external OPAtom
+            MXF file are linked to it with `aaf2`'s MXF linking, so the MasterMob,
+            FileMob and TapeMob carry the MXF's own UMIDs and its real essence
+            descriptor.
         **kwargs: extra adapter arguments
     """
     with aaf2.open(filepath, "w") as f:
@@ -1949,6 +1954,7 @@ def write_to_file(
             use_empty_mob_ids=use_empty_mob_ids,
             embed_essence=embed_essence,
             create_edgecode=create_edgecode,
+            link_media=link_media,
             **kwargs
         )
 

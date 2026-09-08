@@ -14,6 +14,7 @@ from numbers import Rational
 
 import aaf2
 import aaf2.mobs
+import aaf2.mxf
 import abc
 import uuid
 import opentimelineio as otio
@@ -101,7 +102,8 @@ class AAFFileTranscriber:
     otio to aaf. This includes keeping track of unique tapemobs and mastermobs.
     """
 
-    def __init__(self, input_otio, aaf_file, embed_essence, create_edgecode, **kwargs):
+    def __init__(self, input_otio, aaf_file, embed_essence, create_edgecode,
+                 link_media=False, **kwargs):
         """
         AAFFileTranscriber requires an input timeline and an output pyaaf2 file handle.
 
@@ -111,17 +113,23 @@ class AAFFileTranscriber:
             embed_essence(bool): if `True`, media references will be embedded into AAF
             create_edgecode(bool): if `True` each clip will get an EdgeCode slot
                 assigned that defines the Avid Frame Count Start / End.
+            link_media(bool): if `True`, clips referencing an external OPAtom MXF
+                file are linked.
         """
         self.aaf_file = aaf_file
         self.embed_essence = embed_essence
         self.create_edgecode = create_edgecode
+        self.link_media = link_media
         self.compositionmob = self.aaf_file.create.CompositionMob()
         self.compositionmob.name = input_otio.name
         self.compositionmob.usage = "Usage_TopLevel"
         self.aaf_file.content.mobs.append(self.compositionmob)
         self._unique_mastermobs = {}
         self._unique_tapemobs = {}
-        self._clip_mob_ids_map = _gather_clip_mob_ids(input_otio, **kwargs)
+        self._linked_mastermobs = {}
+        self._clip_mob_ids_map = _gather_clip_mob_ids(input_otio,
+                                                      link_media=link_media,
+                                                      **kwargs)
 
         # transcribe timeline comments onto composition mob
         self._transcribe_user_comments(input_otio, self.compositionmob)
@@ -187,16 +195,71 @@ class AAFFileTranscriber:
 
         return tapemob
 
+    def _link_external_mxf(self, otio_clip, mxf_path, media_kind):
+        """Link an external OPAtom MXF, returning a MasterMob and TimelineMobSlot.
+
+        Preserving the material, file and tape package UMIDs, plus essence
+        descriptor. The UMIDs are what an editing application matches the media
+        against, so this is the difference between an AAF that relinks and one
+        that does not.
+
+        Returns:
+            Tuple[aaf2.mobs.MasterMob, aaf2.mobslots.TimelineMobSlot]
+        """
+        cached = self._linked_mastermobs.get(str(mxf_path))
+        if cached:
+            return cached
+
+        # Raises for anything that is not OPAtom, which is the only operation
+        # pattern this can handle.
+        linked_mobs = list(self.aaf_file.content.link_external_mxf(str(mxf_path)))
+
+        mastermobs = [mob for mob in linked_mobs
+                      if isinstance(mob, aaf2.mobs.MasterMob)]
+        if len(mastermobs) != 1:
+            raise AAFAdapterError(
+                f"Expected exactly one MasterMob from linking "
+                f"'{mxf_path}', got {len(mastermobs)}")
+        mastermob = mastermobs[0]
+
+        slots = [slot for slot in mastermob.slots
+                 if isinstance(slot, aaf2.mobslots.TimelineMobSlot)]
+        if not slots:
+            raise AAFAdapterError(
+                f"No TimelineMobSlot on the MasterMob linked from '{mxf_path}'")
+
+        # OPAtom is one essence stream per file, so there is normally a single
+        # slot; prefer one of the track's own media kind if there are more.
+        for slot in slots:
+            if slot.media_kind == media_kind:
+                mastermob_slot = slot
+                break
+        else:
+            mastermob_slot = slots[0]
+
+        if not mastermob.name:
+            mastermob.name = otio_clip.name
+
+        self._transcribe_user_comments(otio_clip, mastermob)
+        self._transcribe_mob_attributes(otio_clip, mastermob)
+        self._transcribe_user_comments(otio_clip.media_reference, mastermob)
+        self._transcribe_mob_attributes(otio_clip.media_reference, mastermob)
+
+        self._linked_mastermobs[str(mxf_path)] = (mastermob, mastermob_slot)
+        return mastermob, mastermob_slot
+
     def track_transcriber(self, otio_track):
         """Return an appropriate _TrackTranscriber given an otio track."""
         if otio_track.kind == otio.schema.TrackKind.Video:
             transcriber = VideoTrackTranscriber(self, otio_track,
                                                 embed_essence=self.embed_essence,
-                                                create_edgecode=self.create_edgecode)
+                                                create_edgecode=self.create_edgecode,
+                                                link_media=self.link_media)
         elif otio_track.kind == otio.schema.TrackKind.Audio:
             transcriber = AudioTrackTranscriber(self, otio_track,
                                                 embed_essence=self.embed_essence,
-                                                create_edgecode=self.create_edgecode)
+                                                create_edgecode=self.create_edgecode,
+                                                link_media=self.link_media)
         else:
             raise otio.exceptions.NotSupportedError(
                 f"Unsupported track kind: {otio_track.kind}")
@@ -301,9 +364,53 @@ def validate_metadata(timeline):
             sum([check.errors for check in all_checks], [])))
 
 
+def _mxf_path_for_clip(otio_clip):
+    """Return the resolved path of a clip's external MXF media, or `None`.
+
+    `None` means this clip is not something MXF linking can handle - it has no
+    media reference, references something other than a file, references a file
+    that is not an existing `.mxf`, or references an MXF whose operation
+    pattern is not OPAtom. None of those are errors; the clip falls through to
+    the synthesised mob chain it would have had without linking at all.
+    """
+    media_ref = otio_clip.media_reference
+    if not isinstance(media_ref, otio.schema.ExternalReference):
+        return None
+    if media_ref.is_missing_reference or not media_ref.target_url:
+        return None
+
+    try:
+        path = Path(otio.url_utils.filepath_from_url(media_ref.target_url))
+    except ValueError:
+        return None
+
+    if path.suffix.lower() != ".mxf" or not path.is_file():
+        return None
+
+    # `link_external_mxf` reads OPAtom only, and raises for the rest. Checking
+    # here instead means an OP1a camera original is simply not linked, rather
+    # than failing an export that would otherwise have succeeded.
+    try:
+        operation_pattern = aaf2.mxf.MXFFile(str(path)).operation_pattern
+    except Exception as e:
+        # `aaf2.mxf` raises bare `Exception`s, so this cannot be narrower.
+        logger.warning(f"Not linking '{path}', which could not be read as an "
+                       f"MXF: {e}")
+        return None
+
+    if operation_pattern != "OPAtom":
+        logger.warning(f"Not linking '{path}': its operation pattern is "
+                       f"{operation_pattern or 'unrecognised'}, and only "
+                       f"OPAtom can be linked.")
+        return None
+
+    return path
+
+
 def _gather_clip_mob_ids(input_otio,
                          prefer_file_mob_id=False,
                          use_empty_mob_ids=False,
+                         link_media=False,
                          **kwargs):
     """
     Create dictionary of otio clips with their corresponding mob ids.
@@ -318,6 +425,20 @@ def _gather_clip_mob_ids(input_otio,
         """Get the MobID from the media_reference.metadata."""
         return (clip.media_reference.metadata.get("AAF", {}).get("MobID") or
                 clip.media_reference.metadata.get("AAF", {}).get("SourceID"))
+
+    def _from_mxf_file(clip):
+        """Get the MobID from the material package of a referenced MXF file.
+
+        This is the id `link_external_mxf` will give the MasterMob, so the
+        mob ids map agrees with the mobs linking actually creates.
+        """
+        path = _mxf_path_for_clip(clip)
+        if path is None:
+            return None
+        material_packages = list(aaf2.mxf.MXFFile(str(path)).material_packages())
+        if len(material_packages) != 1:
+            return None
+        return material_packages[0].mob_id
 
     def _from_aaf_file(clip):
         """ Get the MobID from the AAF file itself."""
@@ -340,6 +461,9 @@ def _gather_clip_mob_ids(input_otio,
         _from_media_reference_metadata,
         _from_aaf_file
     ]
+
+    if link_media:
+        strategies.insert(strategies.index(_from_aaf_file), _from_mxf_file)
 
     if prefer_file_mob_id:
         strategies.remove(_from_aaf_file)
@@ -394,7 +518,7 @@ class _TrackTranscriber:
     __metaclass__ = abc.ABCMeta
 
     def __init__(self, root_file_transcriber, otio_track,
-                 embed_essence, create_edgecode):
+                 embed_essence, create_edgecode, link_media=False):
         """
         _TrackTranscriber
 
@@ -406,6 +530,8 @@ class _TrackTranscriber:
                 embedded into the AAF file
             create_edgecode(bool): if `True` each clip will get an EdgeCode slot
                 assigned that defines the Avid Frame Count Start / End.
+            link_media(bool): if `True`, clips referencing an external OPAtom MXF
+                file are linked to it rather than given a synthesised mob chain.
         """
         self.root_file_transcriber = root_file_transcriber
         self.compositionmob = root_file_transcriber.compositionmob
@@ -414,6 +540,7 @@ class _TrackTranscriber:
         self.edit_rate = self.otio_track.find_children()[0].duration().rate
         self.embed_essence = embed_essence
         self.create_edgecode = create_edgecode
+        self.link_media = link_media
         self.timeline_mobslot, self.sequence = self._create_timeline_mobslot()
         self.timeline_mobslot.name = self.otio_track.name
 
@@ -565,6 +692,9 @@ class _TrackTranscriber:
         """Convert an OTIO Clip into a pyaaf SourceClip.
         If `self.embed_essence` is `True`, we attempt to import / embed
         the media reference target URL file into the new AAF as media essence.
+        Otherwise, if `self.link_media` is `True` and the clip references an
+        existing OPAtom MXF file, the mob chain is linked from that MXF rather
+        than synthesised.
 
         Args:
             otio_clip(otio.schema.Clip): input OTIO clip
@@ -573,6 +703,8 @@ class _TrackTranscriber:
             `aaf2.components.SourceClip`
 
         """
+        mxf_path = _mxf_path_for_clip(otio_clip) if self.link_media else None
+
         if self.embed_essence and not otio_clip.media_reference.is_missing_reference:
             # embed essence for clip media
             target_path = Path(
@@ -599,7 +731,17 @@ class _TrackTranscriber:
                     f"You can add logic to transcode your media for "
                     f"embedding by implementing a "
                     f"'{hooks.HOOK_PRE_WRITE_TRANSCRIBE}' hook.")
+        elif mxf_path is not None:
+            mastermob, mastermob_slot = \
+                self.root_file_transcriber._link_external_mxf(
+                    otio_clip=otio_clip,
+                    mxf_path=mxf_path,
+                    media_kind=self.media_kind,
+                )
         else:
+            # Anything `link_media` cannot link - a missing reference, a
+            # generator, a non-MXF file - still gets the synthesised chain, so
+            # mixed timelines export as they always did.
             tapemob, tapemob_slot = self._create_tapemob(otio_clip)
             filemob, filemob_slot = self._create_filemob(otio_clip, tapemob,
                                                          tapemob_slot)
