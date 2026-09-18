@@ -1912,6 +1912,112 @@ class AAFWriterTests(unittest.TestCase):
     def test_aaf_writer_simple(self):
         self._verify_aaf(SIMPLE_EXAMPLE_PATH)
 
+    def test_aaf_writer_speed_effects(self):
+        """Speed effects survive being written, as a Motion Control
+        OperationGroup.
+
+        They used to be dropped silently, leaving the SourceClip covering the
+        timeline length rather than the source frames consumed. For a reverse
+        that range runs off the end of the media, and Avid rejects the file
+        with PMM_INSUFFICIENT_MEDIA.
+        """
+        otio_timeline = otio.adapters.read_from_file(
+            MISC_SPEED_EFFECTS_EXAMPLE_PATH
+        )
+        fd, tmp_aaf_path = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(otio_timeline, tmp_aaf_path)
+        roundtripped = otio.adapters.read_from_file(tmp_aaf_path)
+
+        def _speeds(timeline):
+            return [
+                [(type(effect).__name__, effect.time_scalar)
+                 for effect in clip.effects]
+                for clip in timeline.tracks[0]
+            ]
+
+        # Covers a freeze frame, a reverse, and speeds either side of 1.
+        self.assertEqual(_speeds(otio_timeline), _speeds(roundtripped))
+
+        for original, clip in zip(otio_timeline.tracks[0],
+                                  roundtripped.tracks[0]):
+            self.assertEqual(original.source_range, clip.source_range)
+            # The source range has to stay inside the media, whatever the
+            # speed - a reverse is expressed by a negative time scalar, not
+            # by counting backwards from the last frame.
+            available_range = clip.media_reference.available_range
+            self.assertTrue(
+                available_range.contains(clip.source_range.start_time),
+                f"{clip.source_range} starts outside {available_range}"
+            )
+
+    def test_aaf_writer_speed_precision(self):
+        """A speed that is not a whole ratio of frame counts survives.
+
+        SpeedRatio is a ratio of the timeline length to the source frames
+        consumed, so on its own it quantises the speed to steps of 1/length:
+        598 timeline frames at 1.04167 became 598/623 and read back as
+        1.04181. The exact speed goes in PARAM_SPEED_MAP_U and
+        PARAM_SPEED_OFFSET_MAP_U alongside it, as Avid writes it.
+        """
+        otio_timeline = otio.adapters.read_from_file(
+            MISC_SPEED_EFFECTS_EXAMPLE_PATH
+        )
+        # An 8 frame clip, so SpeedRatio alone could only say 8/8 == 1.
+        clip = next(clip for clip in otio_timeline.tracks[0]
+                    if clip.effects and clip.effects[0].time_scalar == 2.0)
+        speed = 1.04167
+        clip.effects[0].time_scalar = speed
+
+        fd, tmp_aaf_path = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(otio_timeline, tmp_aaf_path)
+        roundtripped = otio.adapters.read_from_file(tmp_aaf_path)
+
+        scalars = [c.effects[0].time_scalar for c in roundtripped.tracks[0]
+                   if c.effects]
+        self.assertIn(speed, scalars)
+
+        with aaf2.open(tmp_aaf_path) as aaf_file:
+            parameters = [
+                {p.name for p in component.parameters}
+                for mob in aaf_file.content.toplevel()
+                for slot in mob.slots
+                for component in getattr(slot.segment, "components", [])
+                if isinstance(component, OperationGroup)
+            ]
+        self.assertTrue(parameters)
+        for names in parameters:
+            self.assertEqual(
+                names,
+                {"SpeedRatio", "PARAM_SPEED_MAP_U", "PARAM_SPEED_OFFSET_MAP_U"},
+            )
+
+    def test_aaf_writer_speed_source_lengths(self):
+        """Rewriting Avid's own speed fixture reproduces its source lengths.
+
+        A clip at speed s shows source frame floor(i * s) at timeline frame i,
+        so it consumes floor((length - 1) * s) + 1 frames - not the rounded
+        length * s, which over-reads the media by a frame.
+        """
+        def _lengths(path):
+            with aaf2.open(path) as aaf_file:
+                return [
+                    (component.length, component.segments[0].length)
+                    for mob in aaf_file.content.toplevel()
+                    for slot in mob.slots
+                    for component in getattr(slot.segment, "components", [])
+                    if isinstance(component, OperationGroup)
+                ]
+
+        otio_timeline = otio.adapters.read_from_file(
+            MISC_SPEED_EFFECTS_EXAMPLE_PATH
+        )
+        fd, tmp_aaf_path = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(otio_timeline, tmp_aaf_path)
+
+        # Covers a freeze frame, a reverse, and speeds either side of 1.
+        self.assertEqual(_lengths(MISC_SPEED_EFFECTS_EXAMPLE_PATH),
+                         _lengths(tmp_aaf_path))
+
     def test_aaf_writer_transitions(self):
         self._verify_aaf(TRANSITIONS_EXAMPLE_PATH)
 
