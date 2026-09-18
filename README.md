@@ -21,7 +21,7 @@ This adapter was originally included with OpenTimelineIO as a contrib adapter. I
 | Nesting                  |  ✔   |   ✔   |
 | Transitions              |  ✔   |   ✔   |
 | Audio/Video Effects      |  ✖   |   ✖   |
-| Linear Speed Effects     |  ✔   |   ✖   |
+| Linear Speed Effects     |  ✔   |   ✔   |
 | Fancy Speed Effects      |  ✖   |   ✖   |
 | Color Decision List      |  ✖   |   ✖   |
 | Image Sequence Reference |  ✖   |   ✖   |
