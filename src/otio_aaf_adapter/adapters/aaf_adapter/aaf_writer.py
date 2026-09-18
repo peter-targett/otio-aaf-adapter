@@ -1229,9 +1229,11 @@ class _TrackTranscriber:
         # on read via (DescribedSlots[0], EventMobSlot.PhysicalTrackNumber), so this
         # must be the timeline slot id of the track being transcribed.
         aaf_marker['DescribedSlots'].value = {int(self.timeline_mobslot.slot_id)}
-
         aaf_marker['Position'].value = int(range_in_track.start_time.value)
-        aaf_marker['Comment'].value = otio_marker.name
+
+        comment = otio_marker.comment or otio_marker.name
+
+        aaf_marker['Comment'].value = comment
         aaf_marker['CommentMarkerUser'].value = username
         aaf_marker['CommentMarkerColor'].value = marker_color.legacy_rgb
         aaf_marker['CommentMarkerColorExtended'].value = marker_color.extended_rgb
@@ -1243,13 +1245,13 @@ class _TrackTranscriber:
         attr_list = aaf2.misc.TaggedValueHelper(
             aaf_marker['CommentMarkerAttributeList']
         )
-        attr_list["_ATN_CRM_COM"] = otio_marker.name
+        attr_list["_ATN_CRM_COM"] = comment
         attr_list["_ATN_CRM_USER"] = username
         attr_list["_ATN_CRM_DATE"] = date_str
         attr_list["_ATN_CRM_TIME"] = time_str
         attr_list["_ATN_CRM_COLOR"] = marker_color.legacy_name
         attr_list["_ATN_CRM_COLOR_EXTENDED"] = marker_color.extended_name
-        attr_list["_ATN_CRM_MARKNAME"] = otio_marker.name
+        attr_list["_ATN_CRM_MARKNAME"] = comment
         attr_list["_ATN_CRM_LONG_CREATE_DATE"] = create_date
         attr_list["_ATN_CRM_LONG_MOD_DATE"] = mod_date
 
@@ -1259,7 +1261,7 @@ class _TrackTranscriber:
         if database_id:
             attr_list["_ATN_CRM_ID"] = database_id
         user_comments = aaf2.misc.TaggedValueHelper(aaf_marker['UserComments'])
-        user_comments["Comment"] = otio_marker.name
+        user_comments["Comment"] = comment
         if database_id:
             user_comments["DatabaseID"] = database_id
 
