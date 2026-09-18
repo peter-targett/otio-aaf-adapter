@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Tuple
 from typing import List
 from numbers import Rational
+from fractions import Fraction
 
 import aaf2
 import aaf2.mobs
@@ -39,6 +40,17 @@ AAF_PARAMETERDEF_AFX_FG_KEY_OPACITY_U = uuid.UUID(
 AAF_PARAMETERDEF_LEVEL = uuid.UUID("e4962320-2267-11d3-8a4c-0050040ef7d2")
 AAF_VVAL_EXTRAPOLATION_ID = uuid.UUID("0e24dd54-66cd-4f1a-b0a0-670ac3a7a0b3")
 AAF_OPERATIONDEF_SUBMASTER = uuid.UUID("f1db0f3d-8d64-11d3-80df-006008143e6f")
+AAF_OPERATIONDEF_MOTIONCONTROL = uuid.UUID(
+    "9d2ea890-0968-11d3-8a38-0050040ef7d2")
+AAF_PARAMETERDEF_SPEEDRATIO = uuid.UUID(
+    "72559a80-24d7-11d3-8a50-0050040ef7d2")
+AAF_PARAMETERDEF_SPEED_MAP_U = uuid.UUID(
+    "8d56827c-847e-11d5-935a-50f857c10000")
+AAF_PARAMETERDEF_SPEED_OFFSET_MAP_U = uuid.UUID(
+    "8d56827d-847e-11d5-935a-50f857c10000")
+
+# AAF stores a Rational as a pair of int32s.
+AAF_RATIONAL_MAX = 0x7FFFFFFF
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +188,60 @@ def _nearest_timecode(rate):
         nearest_rate = valid_rate
 
     return nearest_rate
+
+
+def _time_warp(otio_clip):
+    """Return the linear time warp on `otio_clip`, or None if it has none.
+
+    `FreezeFrame` subclasses `LinearTimeWarp`, so both work here.
+    """
+    warp = None
+    for effect in otio_clip.effects:
+        if not effect.enabled:
+            continue
+        if warp is None and isinstance(effect, otio.schema.LinearTimeWarp):
+            warp = effect
+        else:
+            logger.warning(
+                "Dropping unsupported effect '{}' ({}) on clip '{}'".format(
+                    effect.name, type(effect).__name__, otio_clip.name))
+    return warp
+
+
+def _source_length(otio_clip):
+    """Return the number of source frames `otio_clip` consumes.
+
+    Includes support for linear speed changes and freeze frames.
+
+    Timeline frame `i` shows source frame `floor(i * speed)`, so the last one
+    reached is `floor((length - 1) * speed)` and the count is one more than
+    that.
+    """
+    length = int(otio_clip.visible_range().duration.value)
+    warp = _time_warp(otio_clip)
+    if warp is None:
+        return length
+    if warp.time_scalar == 0:
+        # A freeze frame holds a single source frame for the whole length.
+        return 1
+    return max(1, int((length - 1) * abs(warp.time_scalar)) + 1)
+
+
+def _aaf_rational(value, max_denominator=100000):
+    """Return `value` as an AAF Rational.
+
+    Converting a float exactly gives a denominator of 2**52 or so, which both
+    reads as noise and overflows once multiplied by a clip length, so round to
+    a denominator of Avid's order instead - shrinking it until both halves fit
+    the int32s an AAF Rational is made of.
+    """
+    while max_denominator > 1:
+        frac = Fraction(value).limit_denominator(max_denominator)
+        if (abs(frac.numerator) <= AAF_RATIONAL_MAX
+                and frac.denominator <= AAF_RATIONAL_MAX):
+            return aaf2.rational.AAFRational(frac.numerator, frac.denominator)
+        max_denominator //= 10
+    return aaf2.rational.AAFRational(int(round(value)), 1)
 
 
 class AAFAdapterError(otio.exceptions.OTIOError):
@@ -666,6 +732,9 @@ class _TrackTranscriber:
             return transition
         elif isinstance(otio_child, otio.schema.Clip):
             source_clip = self.aaf_sourceclip(otio_child)
+            warp = _time_warp(otio_child)
+            if warp is not None:
+                return self.aaf_motion_control(otio_child, source_clip, warp)
             return source_clip
         elif isinstance(otio_child, otio.schema.Track):
             sequence = self.aaf_sequence(otio_child)
@@ -867,7 +936,10 @@ class _TrackTranscriber:
         offset = (otio_clip.visible_range().start_time -
                   otio_clip.available_range().start_time)
         start = int(offset.value)
-        length = int(otio_clip.visible_range().duration.value)
+        # A SourceClip counts source frames, which a time warp makes differ
+        # from the length the clip occupies on the timeline. The timeline
+        # length goes on the OperationGroup `transcribe()` wraps this in.
+        length = _source_length(otio_clip)
 
         compmob_clip = self.compositionmob.create_source_clip(
             slot_id=self.timeline_mobslot.slot_id,
@@ -905,10 +977,118 @@ class _TrackTranscriber:
                 otio_clip.visible_range().start_time.value
             )
             mastermob_slot["MarkOut"].value = int(
-                otio_clip.visible_range().end_time_exclusive().value
-            )
+                otio_clip.visible_range().start_time.value
+            ) + length
 
         return compmob_clip
+
+    def aaf_motion_control(self, otio_clip, aaf_segment, warp):
+        """Wrap `aaf_segment` in a "Motion Control" OperationGroup carrying
+        `warp`.
+
+        Avid expresses a speed change as a time-warp OperationGroup whose
+        length is the timeline length, holding a SourceClip whose length is
+        the source frames consumed. SpeedRatio is the ratio between the two,
+        negative for a reverse - which is the whole of how a reverse is
+        expressed, the SourceClip range staying ascending.
+
+        SpeedRatio alone cannot carry the speed: being a ratio of whole frame
+        counts it quantises to steps of 1/length, so 598 timeline frames at
+        1.04167 become 598/623 and read back as 1.04181. Avid writes the exact
+        speed beside it in PARAM_SPEED_MAP_U and PARAM_SPEED_OFFSET_MAP_U,
+        whose Rationals are not tied to frame counts - in Avid's own files
+        SpeedRatio disagrees with them outright (8/15 where the speed is 2).
+        The reader prefers the offset map, so writing these makes the round
+        trip exact.
+        """
+        datadef = self.aaf_file.dictionary.lookup_datadef(self.media_kind)
+
+        op_def = self.aaf_file.create.OperationDef(
+            AAF_OPERATIONDEF_MOTIONCONTROL, "Motion Control")
+        self.aaf_file.dictionary.register_def(op_def)
+        op_def.media_kind = self.media_kind
+        op_def["IsTimeWarp"].value = True
+        op_def["Bypass"].value = 0
+        op_def["NumberInputs"].value = 1
+        op_def["OperationCategory"].value = "OperationCategory_Effect"
+        op_def["DataDefinition"].value = datadef
+
+        param_def = self.aaf_file.create.ParameterDef(
+            AAF_PARAMETERDEF_SPEEDRATIO,
+            "SpeedRatio",
+            "",
+            self.aaf_file.dictionary.lookup_typedef("Rational"))
+        self.aaf_file.dictionary.register_def(param_def)
+
+        length = int(otio_clip.visible_range().duration.value)
+        speed_ratio = Fraction(length, aaf_segment.length)
+        if warp.time_scalar < 0:
+            speed_ratio = -speed_ratio
+
+        operation_group = self.aaf_file.create.OperationGroup(op_def, length)
+        operation_group.media_kind = self.media_kind
+        operation_group["DataDefinition"].value = datadef
+        operation_group.parameters.append(
+            self.aaf_file.create.ConstantValue(
+                param_def,
+                aaf2.rational.AAFRational(speed_ratio.numerator,
+                                          speed_ratio.denominator)))
+
+        scalar = warp.time_scalar
+
+        # The speed itself, as a single control point - what Avid's own UI
+        # shows.
+        operation_group.parameters.append(
+            self.aaf_varying_value(
+                AAF_PARAMETERDEF_SPEED_MAP_U, "PARAM_SPEED_MAP_U",
+                aaf2.misc.CubicInterpolator, "AvidCubicInterpolator",
+                [(0, scalar)]))
+
+        # The offset map gives the source frame reached at each timeline
+        # frame, so its slope is the speed. A reverse counts down from the
+        # last source frame consumed, which is how Avid writes one and why the
+        # SourceClip range can stay ascending.
+        first_frame = aaf_segment.length - 1 if scalar < 0 else 0
+        operation_group.parameters.append(
+            self.aaf_varying_value(
+                AAF_PARAMETERDEF_SPEED_OFFSET_MAP_U, "PARAM_SPEED_OFFSET_MAP_U",
+                aaf2.misc.LinearInterp, "LinearInterp",
+                [(0, first_frame),
+                 (length, first_frame + length * scalar)]))
+
+        operation_group.segments.append(aaf_segment)
+        return operation_group
+
+    def aaf_varying_value(self, param_auid, param_name, interpolation_auid,
+                          interpolation_name, points):
+        """Return a VaryingValue parameter holding `points`, a list of
+        (time, value) pairs written as AAF Rationals.
+        """
+        param_def = self.aaf_file.create.ParameterDef(
+            param_auid,
+            param_name,
+            "",
+            self.aaf_file.dictionary.lookup_typedef("Rational"))
+        self.aaf_file.dictionary.register_def(param_def)
+
+        interpolation_def = self.aaf_file.create.InterpolationDef(
+            interpolation_auid, interpolation_name, interpolation_name)
+        self.aaf_file.dictionary.register_def(interpolation_def)
+
+        varying_value = self.aaf_file.create.VaryingValue()
+        varying_value.parameterdef = param_def
+        varying_value["Interpolation"].value = interpolation_def
+        varying_value["VVal_Extrapolation"].value = AAF_VVAL_EXTRAPOLATION_ID
+        varying_value["VVal_FieldCount"].value = 1
+
+        for time, value in points:
+            point = self.aaf_file.create.ControlPoint()
+            point["EditHint"].value = "Proportional"
+            point["Time"].value = _aaf_rational(time)
+            point["Value"].value = _aaf_rational(value)
+            varying_value["PointList"].append(point)
+
+        return varying_value
 
     def aaf_transition(self, otio_transition):
         """Convert an otio Transition into an aaf Transition"""
