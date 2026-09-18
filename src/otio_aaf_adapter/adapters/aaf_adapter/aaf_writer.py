@@ -1251,7 +1251,7 @@ class _TrackTranscriber:
         attr_list["_ATN_CRM_TIME"] = time_str
         attr_list["_ATN_CRM_COLOR"] = marker_color.legacy_name
         attr_list["_ATN_CRM_COLOR_EXTENDED"] = marker_color.extended_name
-        attr_list["_ATN_CRM_MARKNAME"] = comment
+        attr_list["_ATN_CRM_MARKNAME"] = otio_marker.name
         attr_list["_ATN_CRM_LONG_CREATE_DATE"] = create_date
         attr_list["_ATN_CRM_LONG_MOD_DATE"] = mod_date
 
