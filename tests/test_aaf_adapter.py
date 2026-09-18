@@ -1988,8 +1988,92 @@ class AAFWriterTests(unittest.TestCase):
         for names in parameters:
             self.assertEqual(
                 names,
-                {"SpeedRatio", "PARAM_SPEED_MAP_U", "PARAM_SPEED_OFFSET_MAP_U"},
+                {"SpeedRatio", "PARAM_SPEED_MAP_U", "PARAM_SPEED_OFFSET_MAP_U",
+                 "AvidMotionInputFormat", "AvidMotionOutputFormat",
+                 "AvidPhase", "AvidMotionPulldown"},
             )
+
+    def test_aaf_writer_speed_control_points(self):
+        """A speed effect's control points match the ones Avid writes.
+
+        Avid tags a speed map RelativeFixed, because its point times are
+        absolute frames; Proportional is for the normalised times it uses on a
+        freeze frame. Writing absolute times as Proportional made Avid rescale
+        them, so a reverse imported as an effect that played forwards. It also
+        hangs PP_BASE_FRAME_U - the source frame the effect starts from, which
+        is the last one consumed for a reverse - and flat tangents off the
+        first point, and sets OpGroupMotionCtlOffsetMapAdjust on the group.
+        """
+        otio_timeline = otio.adapters.read_from_file(
+            MISC_SPEED_EFFECTS_EXAMPLE_PATH
+        )
+
+        fd, tmp_aaf_path = tempfile.mkstemp(suffix='.aaf')
+        otio.adapters.write_to_file(otio_timeline, tmp_aaf_path)
+
+        tangents = {
+            "PP_IN_TANGENT_POS_U": "-2",
+            "PP_IN_TANGENT_VAL_U": "0",
+            "PP_OUT_TANGENT_POS_U": "2",
+            "PP_OUT_TANGENT_VAL_U": "0",
+            "PP_TANGENT_MODE_U": "1",
+        }
+
+        seen_reverse = False
+        with aaf2.open(tmp_aaf_path) as aaf_file:
+            groups = [
+                component
+                for mob in aaf_file.content.toplevel()
+                for slot in mob.slots
+                for component in getattr(slot.segment, "components", [])
+                if isinstance(component, OperationGroup)
+            ]
+            self.assertTrue(groups)
+
+            for group in groups:
+                self.assertEqual(
+                    group["OpGroupMotionCtlOffsetMapAdjust"].value,
+                    aaf2.rational.AAFRational(0, 1),
+                )
+
+                speed_ratio = next(p for p in group.parameters
+                                   if p.name == "SpeedRatio").value
+                reverse = speed_ratio < 0
+                freeze = group.segments[0].length == 1
+                hint = "Proportional" if freeze else "RelativeFixed"
+
+                speed_map = next(p for p in group.parameters
+                                 if p.name == "PARAM_SPEED_MAP_U")
+                offset_map = next(p for p in group.parameters
+                                  if p.name == "PARAM_SPEED_OFFSET_MAP_U")
+
+                for varying_value in (speed_map, offset_map):
+                    for point in varying_value["PointList"].value:
+                        self.assertEqual(point["EditHint"].value, hint)
+
+                # The base frame is 0 forwards, and the last source frame
+                # consumed for a reverse - the same value the offset map
+                # counts down from.
+                point = speed_map["PointList"].value[0]
+                properties = {
+                    p.name: str(p.value)
+                    for p in point["ControlPointPointProperties"].value
+                }
+                expected_base = (
+                    str(group.segments[0].length - 1) if reverse else "0"
+                )
+                self.assertEqual(properties.pop("PP_BASE_FRAME_U"),
+                                 expected_base)
+                self.assertEqual(properties, tangents)
+
+                if reverse:
+                    seen_reverse = True
+                    first, last = offset_map["PointList"].value
+                    self.assertEqual(str(first["Value"].value), expected_base)
+                    self.assertEqual(last["Value"].value,
+                                     aaf2.rational.AAFRational(-1, 1))
+
+        self.assertTrue(seen_reverse, "fixture should contain a reverse")
 
     def test_aaf_writer_speed_source_lengths(self):
         """Rewriting Avid's own speed fixture reproduces its source lengths.

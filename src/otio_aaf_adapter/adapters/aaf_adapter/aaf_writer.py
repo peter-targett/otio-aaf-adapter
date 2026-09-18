@@ -49,6 +49,38 @@ AAF_PARAMETERDEF_SPEED_MAP_U = uuid.UUID(
 AAF_PARAMETERDEF_SPEED_OFFSET_MAP_U = uuid.UUID(
     "8d56827d-847e-11d5-935a-50f857c10000")
 
+# The constants Avid writes on every motion effect, as (AUID, name, value).
+# 2 is "progressive frame"; a phase and a pulldown of 0 mean neither applies.
+# The properties Avid hangs off a PARAM_SPEED_MAP_U control point.
+# PP_BASE_FRAME_U is the source frame the effect starts from - 0 forwards, the
+# last frame consumed for a reverse - and the four tangents are flat, which is
+# what makes an AvidCubicInterpolator curve hold a constant speed.
+AAF_PARAMETERDEF_PP_BASE_FRAME_U = uuid.UUID(
+    "8d568313-847e-11d5-935a-50f857c10000")
+AAF_SPEED_MAP_TANGENTS = (
+    (uuid.UUID("8d56830e-847e-11d5-935a-50f857c10000"),
+     "PP_IN_TANGENT_POS_U", "Rational", -2),
+    (uuid.UUID("8d56830f-847e-11d5-935a-50f857c10000"),
+     "PP_IN_TANGENT_VAL_U", "Rational", 0),
+    (uuid.UUID("8d568310-847e-11d5-935a-50f857c10000"),
+     "PP_OUT_TANGENT_POS_U", "Rational", 2),
+    (uuid.UUID("8d568311-847e-11d5-935a-50f857c10000"),
+     "PP_OUT_TANGENT_VAL_U", "Rational", 0),
+    (uuid.UUID("8d568312-847e-11d5-935a-50f857c10000"),
+     "PP_TANGENT_MODE_U", "aafInt32", 1),
+)
+
+AAF_MOTIONCONTROL_AVID_PARAMETERS = (
+    (uuid.UUID("1c5a02d5-e503-4ca6-8617-d7914bb8ac03"),
+     "AvidMotionInputFormat", 2),
+    (uuid.UUID("8dde1839-6862-4874-a1e9-4fbd1164f22a"),
+     "AvidMotionOutputFormat", 2),
+    (uuid.UUID("5b22ff71-c51b-11d3-a069-006094eb75cb"),
+     "AvidPhase", 0),
+    (uuid.UUID("f7ffed29-fc8e-43ed-943a-4b57b5c157ee"),
+     "AvidMotionPulldown", 0),
+)
+
 # AAF stores a Rational as a pair of int32s.
 AAF_RATIONAL_MAX = 0x7FFFFFFF
 
@@ -941,6 +973,25 @@ class _TrackTranscriber:
         # length goes on the OperationGroup `transcribe()` wraps this in.
         length = _source_length(otio_clip)
 
+        # ...and that is how a speed change can ask for source frames that do
+        # not exist. Avid accepts such a file and shows the effect, then
+        # throws "target sample is entirely past EOF" the moment it plays it,
+        # so say so here rather than leaving it to be found in Avid.
+        available = int(otio_clip.available_range().duration.value)
+        if start + length > available:
+            warp = _time_warp(otio_clip)
+            because = ""
+            if warp is not None:
+                because = " (a speed of {} over {} timeline frames)".format(
+                    warp.time_scalar,
+                    int(otio_clip.visible_range().duration.value))
+            logger.warning(
+                "Clip '%s' needs source frames %d-%d%s, but only %d are "
+                "available - %d past the end. The AAF will import but not "
+                "play.",
+                otio_clip.name, start, start + length - 1, because, available,
+                start + length - available)
+
         compmob_clip = self.compositionmob.create_source_clip(
             slot_id=self.timeline_mobslot.slot_id,
             # XXX: Python3 requires these to be passed as explicit ints
@@ -1020,6 +1071,20 @@ class _TrackTranscriber:
             self.aaf_file.dictionary.lookup_typedef("Rational"))
         self.aaf_file.dictionary.register_def(param_def)
 
+        avid_param_defs = []
+        for param_auid, param_name, _ in AAF_MOTIONCONTROL_AVID_PARAMETERS:
+            avid_param_def = self.aaf_file.create.ParameterDef(
+                param_auid,
+                param_name,
+                "",
+                self.aaf_file.dictionary.lookup_typedef("aafInt32"))
+            self.aaf_file.dictionary.register_def(avid_param_def)
+            avid_param_defs.append(avid_param_def)
+
+        # Avid declares these five on the OperationDef - notably not the two
+        # speed maps, which it writes on the OperationGroup regardless.
+        op_def["ParametersDefined"].extend([param_def] + avid_param_defs)
+
         length = int(otio_clip.visible_range().duration.value)
         speed_ratio = Fraction(length, aaf_segment.length)
         if warp.time_scalar < 0:
@@ -1034,7 +1099,27 @@ class _TrackTranscriber:
                 aaf2.rational.AAFRational(speed_ratio.numerator,
                                           speed_ratio.denominator)))
 
+        # Constants describing the field handling the speed is computed in.
+        # The reader ignores all four; they are here because Avid writes them
+        # on every motion effect of its own.
+        for avid_param_def, (_, _, value) in zip(
+                avid_param_defs, AAF_MOTIONCONTROL_AVID_PARAMETERS):
+            operation_group.parameters.append(
+                self.aaf_file.create.ConstantValue(avid_param_def, value))
+
         scalar = warp.time_scalar
+
+        # The source frame the effect starts from: 0 forwards, and the last
+        # frame consumed for a reverse, which is how Avid expresses one - the
+        # SourceClip range stays ascending and counts down from here.
+        first_frame = aaf_segment.length - 1 if scalar < 0 else 0
+
+        # Avid marks every control point on a *speed* RelativeFixed, whose
+        # times are absolute frames, and reserves Proportional for the
+        # normalised times it writes on a freeze frame. We were writing
+        # absolute times tagged Proportional, so Avid rescaled them and the
+        # effect - a reverse included - came out playing forwards.
+        edit_hint = "Proportional" if scalar == 0 else "RelativeFixed"
 
         # The speed itself, as a single control point - what Avid's own UI
         # shows.
@@ -1042,27 +1127,61 @@ class _TrackTranscriber:
             self.aaf_varying_value(
                 AAF_PARAMETERDEF_SPEED_MAP_U, "PARAM_SPEED_MAP_U",
                 aaf2.misc.CubicInterpolator, "AvidCubicInterpolator",
-                [(0, scalar)]))
+                [(0, scalar)],
+                edit_hint=edit_hint,
+                point_properties=self.aaf_speed_map_point_properties(
+                    first_frame)))
 
         # The offset map gives the source frame reached at each timeline
         # frame, so its slope is the speed. A reverse counts down from the
         # last source frame consumed, which is how Avid writes one and why the
         # SourceClip range can stay ascending.
-        first_frame = aaf_segment.length - 1 if scalar < 0 else 0
         operation_group.parameters.append(
             self.aaf_varying_value(
                 AAF_PARAMETERDEF_SPEED_OFFSET_MAP_U, "PARAM_SPEED_OFFSET_MAP_U",
                 aaf2.misc.LinearInterp, "LinearInterp",
                 [(0, first_frame),
-                 (length, first_frame + length * scalar)]))
+                 (length, first_frame + length * scalar)],
+                edit_hint=edit_hint))
+
+        # Avid writes this on every motion effect of its own; we left it off.
+        operation_group["OpGroupMotionCtlOffsetMapAdjust"].value = (
+            aaf2.rational.AAFRational(0, 1))
 
         operation_group.segments.append(aaf_segment)
         return operation_group
 
+    def aaf_speed_map_point_properties(self, base_frame):
+        """Return the ControlPointPointProperties Avid puts on a speed-map
+        control point: the base frame, and flat tangents for a constant speed.
+        """
+        properties = [(AAF_PARAMETERDEF_PP_BASE_FRAME_U, "PP_BASE_FRAME_U",
+                       "Rational", base_frame)]
+        properties.extend(AAF_SPEED_MAP_TANGENTS)
+
+        values = []
+        for param_auid, param_name, typedef, value in properties:
+            param_def = self.aaf_file.create.ParameterDef(
+                param_auid,
+                param_name,
+                "",
+                self.aaf_file.dictionary.lookup_typedef(typedef))
+            self.aaf_file.dictionary.register_def(param_def)
+            if typedef == "Rational":
+                value = _aaf_rational(value)
+            values.append(self.aaf_file.create.ConstantValue(param_def, value))
+
+        return values
+
     def aaf_varying_value(self, param_auid, param_name, interpolation_auid,
-                          interpolation_name, points):
+                          interpolation_name, points, edit_hint="Proportional",
+                          point_properties=None):
         """Return a VaryingValue parameter holding `points`, a list of
         (time, value) pairs written as AAF Rationals.
+
+        `edit_hint` says how the point times are to be read: Proportional for
+        times normalised over the effect, RelativeFixed for absolute frames.
+        `point_properties`, if given, is hung off the first control point.
         """
         param_def = self.aaf_file.create.ParameterDef(
             param_auid,
@@ -1081,11 +1200,13 @@ class _TrackTranscriber:
         varying_value["VVal_Extrapolation"].value = AAF_VVAL_EXTRAPOLATION_ID
         varying_value["VVal_FieldCount"].value = 1
 
-        for time, value in points:
+        for index, (time, value) in enumerate(points):
             point = self.aaf_file.create.ControlPoint()
-            point["EditHint"].value = "Proportional"
+            point["EditHint"].value = edit_hint
             point["Time"].value = _aaf_rational(time)
             point["Value"].value = _aaf_rational(value)
+            if point_properties and index == 0:
+                point["ControlPointPointProperties"].extend(point_properties)
             varying_value["PointList"].append(point)
 
         return varying_value
